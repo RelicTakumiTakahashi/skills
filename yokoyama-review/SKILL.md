@@ -1,9 +1,9 @@
 ---
-name: relic-yokoyama-review
+name: yokoyama-review
 description: コード変更を、目的に対する変更コスト、設計資料との一致、既存データと導入順序、共通化の時期、運用上の実態からレビューする。一般的な不具合探索に加え、変更を広げる価値があるかを判断するときに使う。
 ---
 
-# relic-yokoyama-review
+# yokoyama-review
 
 変更が解決する問題と、そのために増える複雑さ・管理対象・導入負担を比較する。一般的な正しさの確認を繰り返さず、次の判断を追加する。
 

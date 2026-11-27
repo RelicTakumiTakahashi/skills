@@ -1,0 +1,377 @@
+name: Dependabot Claude Review
+
+on:
+  workflow_call:
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+    inputs:
+      auto_fix:
+        type: boolean
+        default: false
+      auto_approve:
+        type: boolean
+        default: false
+      pr_number:
+        type: string
+        default: ''
+
+concurrency:
+  group: dependabot-claude-review
+  cancel-in-progress: false
+
+env:
+  MARKER: dependabot-claude-review
+  FIXED_LABEL: claude-fixed
+  # claude-code-action の既定の bot_id / bot_name から決まる
+  CLAUDE_COMMITTER: 41898282+claude[bot]@users.noreply.github.com
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: read
+      # gh pr checks はコミットステータスと Actions のランも参照する
+      statuses: read
+      actions: read
+    outputs:
+      prs: ${{ steps.select.outputs.prs }}
+
+    steps:
+      - name: Select pull requests
+        id: select
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          AUTO_FIX: ${{ inputs.auto_fix }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          max_prs=5
+          max_fix_attempts=2
+
+          if [ -n "$PR_NUMBER" ]; then
+            candidates=$(gh pr view "$PR_NUMBER" --json number,headRefName,headRefOid,author,isCrossRepository,state \
+              --jq 'select(.author.login == "app/dependabot" and .state == "OPEN" and (.isCrossRepository | not)) | [{number, headRefName, headRefOid}]')
+            if [ -z "$candidates" ]; then
+              echo "::error::#$PR_NUMBER は Dependabot の PR ではない"
+              exit 1
+            fi
+          else
+            candidates=$(gh pr list --app dependabot --state open --limit 100 --json number,headRefName,headRefOid,isCrossRepository --jq 'map(select(.isCrossRepository | not))')
+          fi
+
+          selected='[]'
+          while read -r pr; do
+            number=$(jq -r '.number' <<< "$pr")
+            branch=$(jq -r '.headRefName' <<< "$pr")
+            sha=$(jq -r '.headRefOid' <<< "$pr")
+
+            markers=$(gh api "repos/$GH_REPO/issues/$number/comments" --paginate \
+              --jq ".[] | select(.user.login == \"github-actions[bot]\") | .body | select(startswith(\"<!-- $MARKER \"))")
+
+            if [ -z "$PR_NUMBER" ] && grep -qF "<!-- $MARKER sha=$sha " <<< "$markers"; then
+              echo "#$number: この版は調査済み"
+              continue
+            fi
+
+            fix_attempts=$(grep -cF " fixed=true -->" <<< "$markers" || true)
+            if [ "$fix_attempts" -ge "$max_fix_attempts" ]; then
+              echo "#$number: 修正を ${fix_attempts} 回試したため人に任せる"
+              continue
+            fi
+
+            # 失敗したチェックがあると非 0 で終わるため、終了コードは見ない
+            pending=$(gh pr checks "$number" --json bucket --jq '[.[] | select(.bucket == "pending")] | length' \
+              2> "$RUNNER_TEMP/checks.err" || true)
+            # チェックが 1 件も無いと JSON を出さずにエラーで終わるため、実行中は 0 件として扱う
+            if [ -z "$pending" ] && grep -qF "no checks reported" "$RUNNER_TEMP/checks.err"; then
+              pending=0
+            fi
+            if [ -z "$pending" ]; then
+              echo "#$number: チェックの結果を取得できないため次回に回す（$(cat "$RUNNER_TEMP/checks.err")）"
+              continue
+            fi
+            if [ "$pending" -gt 0 ]; then
+              echo "#$number: CI が実行中のため次回に回す"
+              continue
+            fi
+
+            [[ "$branch" =~ ^[a-zA-Z0-9._/+@-]+$ ]] || continue
+            other=$(gh api "repos/$GH_REPO/pulls/$number/files" --paginate --jq \
+              '.[] | (.filename, (.previous_filename // empty)) | select(test("(^|/)(composer\\.(json|lock)|package(-lock)?\\.json)$") | not)')
+            if [ -n "$other" ]; then
+              echo "#$number: 依存管理ファイル以外に変更があるため対象外"
+              continue
+            fi
+            can_fix="$AUTO_FIX"
+
+            selected=$(jq -c --argjson number "$number" --arg branch "$branch" --arg sha "$sha" --argjson can_fix "$can_fix" \
+              '. + [{number: $number, branch: $branch, sha: $sha, can_fix: $can_fix}]' <<< "$selected")
+          done < <(jq -c '.[]' <<< "$candidates")
+
+          selected=$(jq -c ".[:$max_prs]" <<< "$selected")
+          echo "対象: $selected"
+          echo "prs=$selected" >> "$GITHUB_OUTPUT"
+
+  review:
+    needs: select
+    if: needs.select.outputs.prs != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        pr: ${{ fromJSON(needs.select.outputs.prs) }}
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+      checks: read
+      statuses: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ matrix.pr.branch }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check head
+        id: head
+        env:
+          EXPECTED_SHA: ${{ matrix.pr.sha }}
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$EXPECTED_SHA" ]; then
+            echo "::notice::head が動いたため次回に回す"
+            echo "moved=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 調査の手順は手元でも使うスキルと共有する。調べる PR のブランチは古い版や書き換えた版を持ちうるため、このワークフローと同じコミットから読む
+      - name: Load skill
+        id: skill
+        if: steps.head.outputs.moved != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_REPO: ${{ job.workflow_repository }}
+          SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$SOURCE_REPO/contents/dependency-impact/SKILL.md?ref=$SHA" \
+            -H "Accept: application/vnd.github.raw" > "$RUNNER_TEMP/skill.md"
+          {
+            echo "body<<SKILL_EOF"
+            awk 'NR == 1 && $0 == "---" { fm = 1; next } fm && $0 == "---" { fm = 0; next } !fm' "$RUNNER_TEMP/skill.md"
+            echo "SKILL_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # 間接的な依存の変化はロックファイルの差分にしか現れない。Claude には差分の全文を読ませず、gh api も許していないため、ここで一覧にして渡す
+      - name: Collect dependency changes
+        id: deps
+        if: steps.head.outputs.moved != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ matrix.pr.number }}
+          EXPECTED_SHA: ${{ matrix.pr.sha }}
+          SOURCE_REPO: ${{ job.workflow_repository }}
+          SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          max_lines=300
+
+          # $(...) の中では set -e が効かないため、失敗は return で返す
+          collect() {
+            local base_ref base
+            gh api "repos/$SOURCE_REPO/contents/dependency-impact/scripts/lock-changes.sh?ref=$SHA" \
+              -H "Accept: application/vnd.github.raw" > "$RUNNER_TEMP/lock-changes.sh" || return 1
+            base_ref=$(gh pr view "$PR_NUMBER" --json baseRefName --jq '.baseRefName') || return 1
+            # 比べる相手はマージベース。ベースブランチの先端だと、PR と無関係な依存の変更が混ざる
+            base=$(gh api "repos/$GH_REPO/compare/$base_ref...$EXPECTED_SHA" --jq '.merge_base_commit.sha') || return 1
+            git -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch --depth=1 origin "$base" >&2 || return 1
+            git diff --no-renames --name-only -z "$base" "$EXPECTED_SHA" > "$RUNNER_TEMP/paths" || return 1
+            local path
+            local -a lock_files=()
+            while IFS= read -r -d '' path; do
+              case "${path##*/}" in
+                composer.lock|package-lock.json) lock_files+=("$path") ;;
+                composer.json|package.json) ;;
+                *) return 1 ;;
+              esac
+            done < "$RUNNER_TEMP/paths"
+            if [ "${#lock_files[@]}" -eq 0 ]; then
+              echo "ロックファイルの変更なし"
+              return 0
+            fi
+            bash "$RUNNER_TEMP/lock-changes.sh" "$base" "$EXPECTED_SHA" "${lock_files[@]}"
+          }
+
+          # 一覧が無いまま調べると判断の根拠が欠けるため、Claude を動かさず、印も残さずに次回に回す
+          if ! collect > "$RUNNER_TEMP/deps.txt"; then
+            echo "::warning::依存の変化を取得できないため次回に回す"
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          lines=$(wc -l < "$RUNNER_TEMP/deps.txt")
+          delimiter=$(uuidgen)
+          changes=$(head -n "$max_lines" "$RUNNER_TEMP/deps.txt")
+          if [ "$lines" -gt "$max_lines" ]; then
+            changes+=$'\n'"（ほか $((lines - max_lines)) 行は省略）"
+            echo "truncated=true" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "changes<<$delimiter"
+            echo "$changes"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+      # 外部の文章に仕込まれた指示で push 用のトークンを持ち出されないよう、WebFetch の宛先と読み書きできるパス・git の引数を絞る
+      - name: Run Claude
+        id: claude
+        if: steps.head.outputs.moved != 'true' && steps.deps.outputs.failed != 'true'
+        uses: anthropics/claude-code-action@374f254f5efaf968abfe15d399fd90972e8138b9 # v1.0.251
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          show_full_output: false
+          additional_permissions: |
+            actions: read
+
+          prompt: |
+            PR: ${{ github.repository }}/pull/${{ matrix.pr.number }}（ブランチ: ${{ matrix.pr.branch }}）
+            Dependabot による依存の更新を調べ、マージしてよいかを判定してください。
+
+            ${{ steps.skill.outputs.body }}
+
+            ## 依存の変化
+            ロックファイルをマージベースと比べた結果（`+` 追加、`-` 削除、`~` 版の変更）。スキルの「依存の変化」として使う。
+            ```
+            ${{ steps.deps.outputs.changes }}
+            ```
+
+            ## この環境での制約
+            - 依存はインストールしていない。npm・composer・テストは実行できないので、実行しないこと
+            - WebFetch で読めるのは github.com・raw.githubusercontent.com・www.npmjs.com・packagist.org だけ
+            - `gh api` とスクリプトは実行できない。依存の変化は上の一覧を使い、脆弱性は PR 本文のリンクか https://github.com/advisories で探す
+
+            ## 修正する
+            ${{ matrix.pr.can_fix && '更新が原因で CI が失敗している、または破壊的変更がこのリポジトリのコードに影響する場合で、直し方に確証があるときは、コードを修正して push する。' || 'この PR は修正しない（ファイルを編集しない）。調査と判定だけを行う。' }}
+            - 対象の依存更新に必要な変更だけを行う
+            - 修正は `git add` → `git commit -m "fix(deps): <日本語の要約>"` → `git push origin HEAD:refs/heads/${{ matrix.pr.branch }}` で行う
+
+            ## 出力
+            判定は `verdict`、本文は `body` で返す。判定は本文に書かない（コメントのヘッダに出る）。
+            日本語で出力すること。結果は structured output で返す。PR へのコメントや approve はしない（後続のステップが行う）。
+
+          claude_args: |
+            --allowedTools "Read,Grep,Glob,WebFetch(domain:github.com),WebFetch(domain:raw.githubusercontent.com),WebFetch(domain:www.npmjs.com),WebFetch(domain:packagist.org),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh run view:*),Bash(gh run list:*),Bash(gh release view:*),Bash(git status),Bash(git diff),Bash(git diff --stat),Bash(git log:*)${{ matrix.pr.can_fix && format(',Edit,Write,Bash(git add:*),Bash(git commit -m:*),Bash(git push origin HEAD:refs/heads/{0})', matrix.pr.branch) || '' }}"
+            --disallowedTools "Read(./.git/**),Edit(./.git/**),Write(./.git/**),Read(//proc/**),Read(//home/runner/work/_temp/**)"
+            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["approve","needs_review"]},"body":{"type":"string"}},"required":["verdict","body"],"additionalProperties":false}'
+
+      - name: Mark fixed
+        id: fixed
+        if: always() && steps.deps.outcome == 'success' && steps.deps.outputs.failed != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ matrix.pr.number }}
+          EXPECTED_SHA: ${{ matrix.pr.sha }}
+        run: |
+          set -euo pipefail
+          current_sha=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')
+          claude_commits=0
+          if [ "$current_sha" != "$EXPECTED_SHA" ]; then
+            # Dependabot の rebase や人の push を Claude の修正と数えないよう、committer で見分ける（--author では変えられない）
+            claude_commits=$(gh api "repos/$GH_REPO/compare/$EXPECTED_SHA...$current_sha" \
+              --jq "[.commits[].commit.committer.email | select(. == \"$CLAUDE_COMMITTER\")] | length")
+          fi
+          if [ "$claude_commits" -eq 0 ]; then
+            echo "fixed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "fixed=true" >> "$GITHUB_OUTPUT"
+          gh label create "$FIXED_LABEL" --color D93F0B \
+            --description "Claude が修正を push した Dependabot PR。人が修正をレビューする" --force
+          gh pr edit "$PR_NUMBER" --add-label "$FIXED_LABEL"
+
+      - name: Post result
+        if: always() && steps.deps.outcome == 'success' && steps.deps.outputs.failed != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ matrix.pr.number }}
+          EXPECTED_SHA: ${{ matrix.pr.sha }}
+          FIXED: ${{ steps.fixed.outputs.fixed }}
+          DEPS_TRUNCATED: ${{ steps.deps.outputs.truncated }}
+          AUTO_APPROVE: ${{ inputs.auto_approve }}
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          RESULT: ${{ steps.claude.outputs.structured_output }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          header=$(printf '<!-- %s sha=%s fixed=%s -->\n## Claude による依存更新の調査（%s）\n\n**approve ' \
+            "$MARKER" "$EXPECTED_SHA" "${FIXED:-false}" "${EXPECTED_SHA:0:7}")
+
+          # 失敗しても同じ版を毎日調べ直さないよう、印だけは残す
+          if [ -z "$RESULT" ] || [ "$CLAUDE_OUTCOME" != success ]; then
+            printf '%sしない**（調査が完了しなかった。[ログ](%s)。PR 番号を指定して手動実行すると調べ直す）\n' \
+              "$header" "$RUN_URL" > "$RUNNER_TEMP/comment.md"
+            gh pr comment "$PR_NUMBER" --body-file "$RUNNER_TEMP/comment.md"
+            exit 0
+          fi
+
+          verdict=$(jq -r '.verdict' <<< "$RESULT")
+          body=$(jq -r '.body' <<< "$RESULT")
+
+          reasons=()
+          [ "$AUTO_APPROVE" = true ] || reasons+=("自動承認は無効")
+          [ "$verdict" = "approve" ] || reasons+=("調査で問題が無いと判断しきれなかった")
+          case "${FIXED:-}" in
+            false) ;;
+            true) reasons+=("Claude が修正を push した") ;;
+            *) reasons+=("Claude が push したかを確認できなかった") ;;
+          esac
+
+          labels=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name')
+          ! grep -qxF "$FIXED_LABEL" <<< "$labels" || reasons+=("\`$FIXED_LABEL\` ラベルが付いている")
+
+          if [ "$AUTO_APPROVE" = true ]; then
+            untrusted=$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER/commits" --paginate \
+              --jq '.[] | select(.author.login != "dependabot[bot]" or .commit.verification.verified != true) | .sha')
+            [ -z "$untrusted" ] || reasons+=("Dependabot の署名付きコミット以外を含む")
+          fi
+
+          current_sha=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')
+          [ "$current_sha" = "$EXPECTED_SHA" ] || reasons+=("調査の後に head が動いた")
+
+          # 省略した分は Claude が見ていないため、問題なしと判断されても approve しない
+          [ "${DEPS_TRUNCATED:-}" != "true" ] || reasons+=("依存の変化が多く、一覧を省略して調べた")
+
+          if [ ${#reasons[@]} -eq 0 ]; then
+            decision="した**"
+          else
+            decision="しない**（$(printf '%s、' "${reasons[@]}" | sed 's/、$//')）"
+          fi
+
+          {
+            echo "$header$decision"
+            echo
+            echo "調査判定: $verdict"
+            echo
+            echo "$body"
+          } > "$RUNNER_TEMP/comment.md"
+          if [ ${#reasons[@]} -eq 0 ]; then
+            jq -n --arg sha "$EXPECTED_SHA" \
+              --arg body "Claude の調査で問題が見つからなかったため approve する。マージは人が判断する" \
+              '{event: "APPROVE", commit_id: $sha, body: $body}' \
+              | gh api "repos/$GH_REPO/pulls/$PR_NUMBER/reviews" --input - > /dev/null
+          fi
+          gh pr comment "$PR_NUMBER" --body-file "$RUNNER_TEMP/comment.md"
